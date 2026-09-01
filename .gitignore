@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+state/*.json
+!state/.gitkeep
+.env
+*.log

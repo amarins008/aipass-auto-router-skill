@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""
+AI-Pass Auto Router - CDP Bridge Engine
+Async WebSocket/CDP execution engine for web LLM portals.
+"""
+
+import asyncio
+import json
+import sys
+import argparse
+import re
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+import uuid
+
+try:
+    import websockets
+    import aiohttp
+except ImportError:
+    print("Missing deps: pip install websockets aiohttp pydantic")
+    sys.exit(1)
+
+# ─── Configuration ──────────────────────────────────────────────
+CDP_HOST = "127.0.0.1"
+CDP_PORT = 9222
+TARGET_URL_PATTERN = "de.aipass.net/chat"
+SKILL_DIR = Path(__file__).parent.parent
+STATE_DIR = SKILL_DIR / "state"
+STATE_DIR.mkdir(exist_ok=True)
+MODEL_STATUS_FILE = STATE_DIR / "model_status.json"
+ROUTING_FILE = SKILL_DIR / "references" / "routing.md"
+
+# ─── Data Models ────────────────────────────────────────────────
+
+
+@dataclass
+class ModelInfo:
+    id: str
+    name: str
+    task_classes: List[str] = field(default_factory=list)
+    priority: int = 999
+    available: bool = True
+    cooldown_until: Optional[str] = None
+    last_used: Optional[str] = None
+    error_count: int = 0
+
+
+@dataclass
+class CDPTarget:
+    id: str
+    type: str
+    title: str
+    url: str
+    webSocketDebuggerUrl: str
+    description: Optional[str] = None
+    devtoolsFrontendUrl: Optional[str] = None
+    faviconUrl: Optional[str] = None
+
+
+@dataclass
+class RouteResult:
+    success: bool
+    model_used: str
+    response: str
+    error: Optional[str] = None
+    fallback_used: bool = False
+    cooldown_triggered: bool = False
+
+
+# ─── Model Status Manager ───────────────────────────────────────
+
+
+class ModelStatusManager:
+    def __init__(self, status_file: Path):
+        self.status_file = status_file
+        self.models: Dict[str, ModelInfo] = {}
+        self.load()
+
+    def load(self):
+        if self.status_file.exists():
+            try:
+                data = json.loads(self.status_file.read_text(encoding="utf-8"))
+                self.models = {k: ModelInfo(**v) for k, v in data.items()}
+            except Exception:
+                self.models = {}
+        self._expire_cooldowns()
+
+    def save(self):
+        self._expire_cooldowns()
+        data = {k: asdict(v) for k, v in self.models.items()}
+        self.status_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _expire_cooldowns(self):
+        now = datetime.now()
+        for m in self.models.values():
+            if m.cooldown_until:
+                try:
+                    cd = datetime.fromisoformat(m.cooldown_until)
+                    if cd <= now:
+                        m.cooldown_until = None
+                        m.available = True
+                except Exception:
+                    m.cooldown_until = None
+
+    def get_available_for_class(self, task_class: str, routing: Dict[str, List[str]]) -> List[ModelInfo]:
+        """Return available models for task class.
+
+        Priority: routing.md list first, then ANY other model that has this
+        task class in its inferred classes. This way if all priority models
+        are on cooldown, we still have fallback candidates.
+        """
+        # First: explicit routing list
+        explicit = []
+        seen = set()
+        for mid in routing.get(task_class, []):
+            model = self.models.get(mid)
+            if model and model.available and not model.cooldown_until:
+                explicit.append(model)
+                seen.add(mid)
+
+        explicit = sorted(explicit, key=lambda m: m.priority)
+
+        # Second: any other model that has this task class
+        fallback = []
+        for mid, model in self.models.items():
+            if mid in seen:
+                continue
+            if not model.available or model.cooldown_until:
+                continue
+            if task_class in (model.task_classes or []):
+                fallback.append(model)
+
+        fallback = sorted(fallback, key=lambda m: (m.priority, m.id))
+
+        return explicit + fallback
+
+    def set_cooldown(self, model_id: str, minutes: int = 15):
+        if model_id in self.models:
+            m = self.models[model_id]
+            m.cooldown_until = (datetime.now() + timedelta(minutes=minutes)).isoformat()
+            m.available = False
+            m.error_count += 1
+            self.save()
+
+    def record_use(self, model_id: str):
+        if model_id in self.models:
+            m = self.models[model_id]
+            m.last_used = datetime.now().isoformat()
+            self.save()
+
+    def update_from_scan(self, discovered: List[ModelInfo]):
+        for m in discovered:
+            if m.id not in self.models:
+                self.models[m.id] = m
+            else:
+                existing = self.models[m.id]
+                existing.name = m.name
+                existing.task_classes = m.task_classes
+                existing.priority = m.priority
+        self.save()
+
+
+# ─── CDP Client ─────────────────────────────────────────────────
+
+
+class CDPClient:
+    def __init__(self, host: str = CDP_HOST, port: int = CDP_PORT):
+        self.host = host
+        self.port = port
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.target: Optional[CDPTarget] = None
+        self._msg_id = 0
+
+    async def connect(self) -> bool:
+        """Discover and connect to the ThaiAI-Pass tab."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://{self.host}:{self.port}/json/list") as resp:
+                    targets = await resp.json()
+
+            for t in targets:
+                if TARGET_URL_PATTERN in t.get("url", ""):
+                    self.target = CDPTarget(**t)
+                    break
+
+            if not self.target:
+                print(f"No tab found matching {TARGET_URL_PATTERN}", file=sys.stderr)
+                return False
+
+            self.ws = await websockets.connect(self.target.webSocketDebuggerUrl)
+            await self._send("Runtime.enable")
+            await self._send("Page.enable")
+            await self._send("DOM.enable")
+            return True
+        except Exception as e:
+            print(f"CDP connect failed: {e}", file=sys.stderr)
+            return False
+
+    async def _send(self, method: str, params: Dict = None) -> Dict:
+        self._msg_id += 1
+        msg = {"id": self._msg_id, "method": method, "params": params or {}}
+        await self.ws.send(json.dumps(msg))
+        while True:
+            resp = json.loads(await self.ws.recv())
+            if resp.get("id") == self._msg_id:
+                if "error" in resp:
+                    raise Exception(f"CDP error: {resp['error']}")
+                return resp.get("result", {})
+
+    async def evaluate(self, expression: str, await_promise: bool = True) -> Any:
+        result = await self._send("Runtime.evaluate", {
+            "expression": expression,
+            "awaitPromise": await_promise,
+            "returnByValue": True,
+            "userGesture": True,
+        })
+        if "exceptionDetails" in result:
+            raise Exception(f"JS error: {result['exceptionDetails']}")
+        return result.get("result", {}).get("value")
+
+    async def call_function(self, function_declaration: str, args: List = None) -> Any:
+        """Call a function in the page context."""
+        expr = f"({function_declaration})({json.dumps(args or [])})"
+        return await self.evaluate(expr)
+
+    async def close(self):
+        if self.ws:
+            await self.ws.close()
+
+
+# ─── Bridge Engine ──────────────────────────────────────────────
+
+
+class AIPassBridge:
+    def __init__(self):
+        self.cdp = CDPClient()
+        self.status_mgr = ModelStatusManager(MODEL_STATUS_FILE)
+        self.routing = self._load_routing()
+
+    def _load_routing(self) -> Dict[str, List[str]]:
+        """Parse routing.md for task-class -> model priority lists."""
+        routing = {}
+        if ROUTING_FILE.exists():
+            content = ROUTING_FILE.read_text(encoding="utf-8")
+            current_class = None
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("## "):
+                    current_class = line[3:].strip().lower()
+                    routing[current_class] = []
+                elif line.startswith("- ") and current_class:
+                    # Full model name after "- " (e.g., "Pathumma ThaiLLM 8B")
+                    model_id = line[2:].strip()
+                    routing[current_class].append(model_id)
+        return routing
+
+    async def list_targets(self) -> List[CDPTarget]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://{self.host}:{self.port}/json/list") as resp:
+                targets = await resp.json()
+        return [CDPTarget(**t) for t in targets if t.get("type") == "page"]
+
+    async def scan_models(self) -> List[ModelInfo]:
+        """Scan the page for available models.
+
+        ThaiAI-Pass uses a Radix-UI modal (NOT a <select>). The model selector
+        trigger is a button; clicking it opens a modal with model cards. Each
+        card has data-testid="model-card" and an <img alt="MODEL_NAME">.
+        """
+        if not await self.cdp.connect():
+            return []
+
+        # Close any open modal first
+        await self.cdp.evaluate(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key:'Escape', keyCode:27, bubbles:true}))"
+        )
+        await asyncio.sleep(0.4)
+
+        # Open model selector
+        opened = await self.cdp.evaluate(
+            "(()=>{const b=document.querySelector('[data-testid=\"model-selector-trigger\"]');"
+            "if(b){b.click();return true;}return false;})()"
+        )
+        if not opened:
+            await self.cdp.close()
+            return []
+        await asyncio.sleep(1.0)
+
+        # Harvest model names from cards
+        raw = await self.cdp.evaluate("""
+            JSON.stringify(Array.from(document.querySelectorAll('[data-testid="model-card"]'))
+                .map(c => c.querySelector('img[alt]')?.alt)
+                .filter(Boolean))
+        """)
+
+        # Close modal
+        await self.cdp.evaluate(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key:'Escape', keyCode:27, bubbles:true}))"
+        )
+        await asyncio.sleep(0.3)
+
+        await self.cdp.close()
+
+        if not raw:
+            return []
+
+        # raw is already a JSON string (we used JSON.stringify)
+        names = json.loads(raw) if isinstance(raw, str) else raw
+
+        discovered = []
+        for idx, name in enumerate(names):
+            task_classes = self._infer_task_classes(name, name)
+            discovered.append(ModelInfo(
+                id=name,
+                name=name,
+                task_classes=task_classes,
+                priority=idx,
+            ))
+
+        self.status_mgr.update_from_scan(discovered)
+        return discovered
+
+    def _infer_task_classes(self, name: str, model_id: str) -> List[str]:
+        """Heuristic: infer task classes from model name/id."""
+        name_lower = name.lower()
+        id_lower = model_id.lower()
+        classes = []
+
+        if any(k in name_lower or k in id_lower for k in ["code", "coding", "program", "dev"]):
+            classes.append("code")
+        if any(k in name_lower or k in id_lower for k in ["reason", "deep", "think", "opus", "sonnet"]):
+            classes.append("deep-reasoning")
+        if any(k in name_lower or k in id_lower for k in ["thai", "ไทย", "scb", "tllm"]):
+            classes.append("thai-content")
+        if any(k in name_lower or k in id_lower for k in ["fast", "flash", "haiku", "mini", "lite", "small"]):
+            classes.append("fast")
+        if any(k in name_lower or k in id_lower for k in ["research", "search", "pro", "max", "ultra", "opus"]):
+            classes.append("research")
+
+        # Default: if no specific class, add to all
+        if not classes:
+            classes = ["code", "deep-reasoning", "thai-content", "fast", "research"]
+
+        return classes
+
+    async def route_prompt(self, task_class: str, prompt: str) -> RouteResult:
+        """Route prompt to best available model for task class."""
+        if not await self.cdp.connect():
+            return RouteResult(False, "", "", error="CDP connection failed")
+
+        try:
+            # Get available models for this task class
+            available = self.status_mgr.get_available_for_class(task_class, self.routing)
+
+            if not available:
+                await self.cdp.close()
+                return RouteResult(
+                    False, "", "",
+                    error=f"No available models for task class: {task_class}",
+                    cooldown_triggered=True
+                )
+
+            # Try each model in priority order
+            for model in available:
+                print(f"  [bridge] Trying: {model.id}", file=sys.stderr)
+                result = await self._try_model(model, prompt)
+                if result.success:
+                    self.status_mgr.record_use(model.id)
+                    self.status_mgr.save()
+                    await self.cdp.close()
+                    return result
+
+                # Model failed - log reason and trigger cooldown
+                print(f"  [bridge] FAILED {model.id}: {result.error}", file=sys.stderr)
+                self.status_mgr.set_cooldown(model.id, 15)
+                self.status_mgr.save()
+
+            await self.cdp.close()
+            return RouteResult(
+                False, "", "",
+                error="All models exhausted for task class",
+                cooldown_triggered=True
+            )
+
+        except Exception as e:
+            await self.cdp.close()
+            return RouteResult(False, "", "", error=str(e))
+
+    async def _try_model(self, model: ModelInfo, prompt: str) -> RouteResult:
+        """Attempt to send prompt using specific model."""
+        try:
+            # 1. Select model in dropdown
+            await self._select_model(model.id)
+
+            # 2. Inject prompt
+            await self._inject_prompt(prompt)
+
+            # 3. Trigger send
+            await self._trigger_send()
+
+            # 4. Wait for response
+            response = await self._wait_for_response()
+
+            # 5. Check for error toasts (rate limit, quota)
+            if await self._check_error_toast():
+                return RouteResult(False, model.id, "", error="Rate limit / quota error")
+
+            return RouteResult(True, model.id, response)
+
+        except Exception as e:
+            return RouteResult(False, model.id, "", error=str(e))
+
+    async def _select_model(self, model_id: str):
+        """Select a model by clicking its card in the Radix-UI modal.
+
+        Real DOM (verified Sep 2026):
+          - Trigger:  [data-testid="model-selector-trigger"]
+          - Modal:    [data-testid="model-selector-modal"]
+          - Card:     [data-testid="model-card"]  (role=button, clickable)
+          - Card name: <img alt="MODEL_NAME">
+        """
+        # Close any open modal first
+        await self._close_modal()
+        await asyncio.sleep(0.4)
+
+        # Open the modal and wait for it to appear
+        for attempt in range(3):
+            opened = await self.cdp.evaluate(
+                "(()=>{const b=document.querySelector('[data-testid=\\\"model-selector-trigger\\\"]');"
+                "if(b){b.click();return true;}return false;})()"
+            )
+            if not opened:
+                raise Exception("Model selector trigger not found")
+
+            # Wait for modal to actually appear (poll for up to 3s)
+            for _ in range(15):
+                await asyncio.sleep(0.2)
+                modal_visible = await self.cdp.evaluate(
+                    "!!document.querySelector('[data-testid=\\\"model-selector-modal\\\"]')"
+                )
+                if modal_visible:
+                    break
+            else:
+                # Modal didn't appear, retry
+                if attempt < 2:
+                    continue
+                raise Exception("Modal did not appear after 3 attempts")
+
+            # Now click the card
+            js = f"""
+            (() => {{
+                const cards = Array.from(document.querySelectorAll('[data-testid="model-card"]'));
+                for (const card of cards) {{
+                    const img = card.querySelector('img[alt]');
+                    if (img && img.alt === {json.dumps(model_id)}) {{
+                        // Use pointerdown + click for Radix compatibility
+                        card.dispatchEvent(new PointerEvent('pointerdown', {{bubbles: true}}));
+                        card.click();
+                        return JSON.stringify({{ok: true}});
+                    }}
+                }}
+                return JSON.stringify({{ok: false, available: cards.map(c => c.querySelector('img[alt]')?.alt).filter(Boolean)}});
+            }})()
+            """
+            result = await self.cdp.evaluate(js)
+            parsed = json.loads(result) if isinstance(result, str) else result
+
+            if parsed.get("ok"):
+                # Wait for modal to close (card click should dismiss it)
+                for _ in range(10):
+                    await asyncio.sleep(0.1)
+                    modal_still = await self.cdp.evaluate(
+                        "!!document.querySelector('[data-testid=\\\"model-selector-modal\\\"]')"
+                    )
+                    if not modal_still:
+                        return
+                # Modal stuck open, close it
+                await self._close_modal()
+                return
+
+            # Card not found - check if modal was filtered (provider filter changed)
+            # Reset by closing modal and retrying
+            await self._close_modal()
+            await asyncio.sleep(0.3)
+            if attempt < 2:
+                continue
+
+            avail = parsed.get("available", [])
+            raise Exception(
+                f"Model '{model_id}' not found in selector. "
+                f"Available: {avail[:10]}{'...' if len(avail) > 10 else ''}"
+            )
+
+    async def _close_modal(self):
+        """Close any open modal via Escape key."""
+        try:
+            await self.cdp.evaluate("""
+                (() => {
+                    document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', keyCode:27, bubbles:true}));
+                    document.body.click();
+                })()
+            """)
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    async def _inject_prompt(self, prompt: str):
+        """Inject prompt into the chat textarea using the React-compatible setter."""
+        escaped = json.dumps(prompt, ensure_ascii=False)
+        js = f"""
+        (() => {{
+            const ta = document.querySelector('textarea');
+            if (!ta) return JSON.stringify({{ok: false, reason: 'no textarea'}});
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+            setter.call(ta, {escaped});
+            ta.dispatchEvent(new Event('input', {{bubbles: true}}));
+            ta.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return JSON.stringify({{ok: true, len: ta.value.length}});
+        }})()
+        """
+        result = await self.cdp.evaluate(js)
+        parsed = json.loads(result) if isinstance(result, str) else result
+        if not parsed.get("ok"):
+            raise Exception(f"Inject failed: {parsed.get('reason', 'unknown')}")
+
+    async def _trigger_send(self):
+        """Click the real send button: [data-testid='send-button']."""
+        js = """
+        (() => {
+            const btn = document.querySelector('[data-testid="send-button"]');
+            if (!btn) return JSON.stringify({ok: false, reason: 'no send button'});
+            if (btn.disabled) return JSON.stringify({ok: false, reason: 'disabled'});
+            btn.click();
+            return JSON.stringify({ok: true});
+        })()
+        """
+        result = await self.cdp.evaluate(js)
+        parsed = json.loads(result) if isinstance(result, str) else result
+        if not parsed.get("ok"):
+            raise Exception(f"Send failed: {parsed.get('reason', 'unknown')}")
+
+    async def _wait_for_response(self, timeout: float = 120.0) -> str:
+        """Wait for the assistant response to stabilize and return only the new response."""
+        start = time.time()
+        last_text = ""
+        stable_count = 0
+
+        # Record the current last assistant message count before sending.
+        # ThaiAI-Pass uses [data-role="assistant"] (verified Sep 2026).
+        # Fall back to common ChatGPT-style selectors.
+        before_expr = """
+        (() => {
+            const sels = [
+                'main [data-role="assistant"]',
+                '[data-message-author-role="assistant"]',
+                'article[data-role="assistant"]',
+                '[data-testid="message-assistant"]',
+            ];
+            for (const sel of sels) {
+                const els = document.querySelectorAll(sel);
+                if (els.length > 0) return els.length;
+            }
+            return 0;
+        })()
+        """
+        before_count = await self.cdp.evaluate(before_expr)
+        before_count = int(before_count) if before_count else 0
+
+        # Pick the most reliable selector for messages (ThaiAI-Pass first)
+        message_selectors = [
+            'main [data-role="assistant"]',
+            '[data-message-author-role="assistant"]',
+            'article[data-role="assistant"]',
+            '[data-testid="message-assistant"]',
+        ]
+
+        while time.time() - start < timeout:
+            try:
+                # Find the last assistant message and extract its text content
+                expr = f"""
+                (() => {{
+                    let msgs = [];
+                    for (const sel of {json.dumps(message_selectors)}) {{
+                        msgs = Array.from(document.querySelectorAll(sel));
+                        if (msgs.length > 0) break;
+                    }}
+                    if (msgs.length <= {before_count}) return '';
+                    const last = msgs[msgs.length - 1];
+
+                    // Target the markdown content container to avoid action buttons
+                    // (Copy/Like/Dislike/Refresh) which are siblings in the message wrapper.
+                    const md = last.querySelector('.markdown-content') || last;
+
+                    // Deep text extraction: walk all leaf text nodes, skip button/svg/script.
+                    function extractText(el) {{
+                        if (!el) return '';
+                        const tag = el.tagName || '';
+                        if (['BUTTON', 'SVG', 'SCRIPT', 'STYLE', 'NOSCRIPT'].includes(tag)) return '';
+                        let text = '';
+                        for (const node of el.childNodes) {{
+                            if (node.nodeType === 3) {{
+                                text += node.textContent;
+                            }} else if (node.nodeType === 1) {{
+                                text += extractText(node);
+                            }}
+                        }}
+                        return text;
+                    }}
+                    const raw = extractText(md);
+                    // Clean up excessive whitespace
+                    return raw.replace(/[ \\t]+/g, ' ').replace(/\\n{{3,}}/g, '\\n\\n').trim();
+                }})()
+                """
+                text = await self.cdp.evaluate(expr)
+
+                # Ignore common "loading" placeholders - the real text will follow.
+                if text and text in ('กำลังประมวลผล กรุณารอสักครู่', 'Loading...', 'กำลังโหลด...', '...'):
+                    text = ''
+
+                if text and text != last_text:
+                    last_text = text
+                    stable_count = 0
+                elif text:
+                    stable_count += 1
+                    if stable_count >= 12:  # stable for ~6s (0.5s intervals)
+                        break
+                else:
+                    stable_count = 0
+
+                # Also check if stop button exists (still generating)
+                stop_btn = await self.cdp.evaluate("""
+                    !!document.querySelector('[data-testid="stop-button"]') ||
+                    Array.from(document.querySelectorAll('button')).some(b =>
+                        /stop generating|หยุด/i.test(b.textContent || '')
+                    )
+                """)
+                if not stop_btn and text:
+                    stable_count += 1
+                    if stable_count >= 3:
+                        break
+
+                await asyncio.sleep(0.5)
+            except Exception:
+                await asyncio.sleep(0.5)
+
+        return last_text.strip()
+
+    async def _check_error_toast(self) -> bool:
+        """Check for rate limit / quota error toasts."""
+        try:
+            expr = """
+            const toasts = document.querySelectorAll('[role="alert"], .toast, .notification, [data-testid="toast"]');
+            for (const t of toasts) {
+                const text = (t.innerText || t.textContent || '').toLowerCase();
+                if (text.includes('rate limit') || text.includes('quota') || text.includes('exceeded') || text.includes('too many') || text.includes('429')) {
+                    return true;
+                }
+            }
+            return false;
+            """
+            return await self.cdp.evaluate(expr)
+        except Exception:
+            return False
+
+
+# ─── CLI ────────────────────────────────────────────────────────
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="AI-Pass Auto Router Bridge")
+    parser.add_argument("--task-class", choices=["code", "deep-reasoning", "thai-content", "fast", "research"], help="Task class for routing")
+    parser.add_argument("--prompt", help="Prompt to send")
+    parser.add_argument("--list-targets", action="store_true", help="List available CDP targets")
+    parser.add_argument("--scan", action="store_true", help="Scan models in active tab")
+
+    args = parser.parse_args()
+
+    bridge = AIPassBridge()
+
+    if args.list_targets:
+        targets = await bridge.list_targets()
+        for t in targets:
+            print(f"  {t.id}: {t.title} - {t.url}")
+        return
+
+    if args.scan:
+        models = await bridge.scan_models()
+        print(f"Discovered {len(models)} models:")
+        for m in models:
+            print(f"  {m.id}: {m.name} (classes: {', '.join(m.task_classes)}, priority: {m.priority})")
+        return
+
+    if args.task_class and args.prompt:
+        result = await bridge.route_prompt(args.task_class, args.prompt)
+        if result.success:
+            print(result.response)
+        else:
+            print(f"ERROR: {result.error}", file=sys.stderr)
+            if result.cooldown_triggered:
+                print("Cooldowns active. Check /aipass-status", file=sys.stderr)
+            sys.exit(1)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
