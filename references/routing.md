@@ -75,9 +75,34 @@ Models with broad knowledge, long context, and research capabilities.
 - Gemini 3.1 Pro (Preview)
 - Sonar
 
----
+## music
+Text-to-music generation.
 
-## Notes
+- Lyria 3 Pro
+- Lyria 3 Clip
+
+## image
+Image generation from text prompts. Returns base64/URL in the assistant message.
+
+- Nano Banana Pro
+- Nano Banana
+- Seedream 5.0 Lite
+- Seedream 4.0
+
+## video
+Text-to-video generation. Higher latency than image.
+
+- Veo 3.1 Fast
+- Seedance 2.0
+- Seedance 2.0 Fast
+- Seedance 2.0 Mini
+
+## audio
+Audio/speech generation (TTS, voice).
+
+- (TTS models in ThaiAI-Pass; if unavailable, fall back to text)
+
+---
 
 - **Auto-routing uses the EXACT model name** (e.g., "Claude Sonnet 5") as the model ID — no slug translation.
 - Cooldowns (15 min default) are tracked per-model in `state/model_status.json`.
