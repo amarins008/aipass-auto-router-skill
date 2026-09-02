@@ -25,13 +25,16 @@ except ImportError:
 
 # ─── Auto-class Detection Rules ─────────────────────────────────
 AUTO_CLASS_RULES = [
+    (r"ภาพ.*(?:ไทย|ตัวหนังสือ)|ตัวหนังสือ.*(?:ไทย|ภาพ)|generate.*thai.*text|thai.*text.*image", "image-thai"),
+    (r"สร้าง.*(?:รูป|ภาพ).*thai|วาด.*(?:ไทย|ตัวหนังสือ)|draw.*thai", "image-thai"),
     (r"วิดีโอ|คลิป|\bvideo\b|\bclip\b|animation|animated", "video"),
     (r"เพลง|ดนตรี|\bmusic\b|\bsong\b|jingle|beat|melody", "music"),
     (r"สร้าง.*รูป|วาด.*รูป|ภาพ|รูปภาพ|\bdraw\b|\bpaint\b|\bsketch\b|illustration|generate.*image|image.*of|\bdiffusion\b", "image"),
-    (r"พิสูจน์|ทฤษฎีบท|\bproof\b|\bprove\b|\btheorem\b|\baxiom\b|mathematical.*proof|formal.*logic|induction", "deep-reasoning"),
+    (r"พิสูจน์|ทฤษฎีบท|\bproof\b|\bprove\b|\btheorem\b|\baxiom\b|mathematical.*proof|formal.*logic|induction|วิเคราะห์.*root.*cause|ทำไม.*(server|error|bug|fail)|root.*cause|deep.*analysis|analyze.*why", "deep-reasoning"),
     (r"เขียน.*(?:code|โค้ด|function|class|script|api|program)|เขียน(?:โปรแกรม)?|implement|refactor|debug"
      r"|\b(?:python|javascript|typescript|java|c\+\+|rust|go|ruby|php|sql|html|css|react|vue|angular|node\.?js)\b"
-     r"|recursion|regex|algorithm|data structure|\bapi\b|\boop\b|\bsql\b|\borm\b|docker|kubernetes|git|linux.*command",
+     r"|recursion|regex|algorithm|data structure|\bapi\b|\boop\b|\bsql\b|\borm\b|docker|kubernetes|git|linux.*command"
+     r"|\bfix\b|\bdebug\b|\bpatch\b|refactor.*(code|function)|แก้บั๊ก|แก้.*โค้ด|แก้.*error|แก้.*bug",
      "code"),
     (r"สรุป.*(?:ยาว|ละเอียด|comprehensive)|\bresearch\b|วิเคราะห์.*เชิงลึก|comprehensive.*analysis|in.*depth|survey.*of", "research"),
     (r"แปล.*(?:ไทย|thai)|translate.*thai|ภาษาไทย|เขียน.*(?:บทความ|ข่าว|เนื้อหา).*ไทย", "thai-content"),
@@ -268,12 +271,32 @@ class AIPassBridge:
         self._last_model_id: Optional[str] = None
         self._lock = asyncio.Lock()  # serialize requests to same CDP target
 
+    async def _ensure_connection(self):
+        """Re-establish CDP WebSocket connection if closed/dropped.
+
+        Called by route_prompt() to transparently recover from
+        ConnectionResetError (10054) without raising to the caller.
+        Returns True if connection is usable, False if reconnect failed.
+        """
+        if self.cdp.ws is None or getattr(self.cdp.ws, 'closed', True):
+            self._cdp_connected = False
+        if not self._cdp_connected:
+            try:
+                self._cdp_connected = await self.cdp.connect()
+            except Exception as e:
+                print(f"  [bridge] reconnect failed: {type(e).__name__}: {e}", file=sys.stderr)
+                self._cdp_connected = False
+        return self._cdp_connected
+
+
 
     AUTO_CLASS_RULES = [
+        (r"ภาพ.*(?:ไทย|ตัวหนังสือ)|ตัวหนังสือ.*(?:ไทย|ภาพ)|generate.*thai.*text|thai.*text.*image", "image-thai"),
+        (r"สร้าง.*(?:รูป|ภาพ).*thai|วาด.*(?:ไทย|ตัวหนังสือ)|draw.*thai", "image-thai"),
         (r"วิดีโอ|คลิป|\bvideo\b|\bclip\b|animation|animated", "video"),
         (r"เพลง|ดนตรี|\bmusic\b|\bsong\b|jingle|beat|melody", "music"),
         (r"สร้าง.*รูป|วาด.*รูป|ภาพ|รูปภาพ|\bdraw\b|\bpaint\b|\bsketch\b|illustration|generate.*image|image.*of|\bdiffusion\b", "image"),
-        (r"พิสูจน์|ทฤษฎีบท|\bproof\b|\bprove\b|\btheorem\b|\baxiom\b|mathematical.*proof|formal.*logic|induction", "deep-reasoning"),
+        (r"พิสูจน์|ทฤษฎีบท|\bproof\b|\bprove\b|\btheorem\b|\baxiom\b|mathematical.*proof|formal.*logic|induction|วิเคราะห์.*root.*cause|ทำไม.*(server|error|bug|fail)|root.*cause|deep.*analysis|analyze.*why", "deep-reasoning"),
         (r"เขียน.*(?:code|โค้ด|function|class|script|api|program)|เขียน(?:โปรแกรม)?|implement|refactor|debug|\b(?:python|javascript|typescript|java|c\+\+|rust|go|ruby|php|sql|html|css|react|vue|angular|node\.?js)\b|recursion|regex|algorithm|data structure|\bapi\b|\boop\b|\bsql\b|docker|kubernetes|git|linux.*command", "code"),
         (r"สรุป.*(?:ยาว|ละเอียด|comprehensive)|\bresearch\b|วิเคราะห์.*เชิงลึก|comprehensive.*analysis|in.*depth|survey.*of", "research"),
         (r"แปล.*(?:ไทย|thai)|translate.*thai|ภาษาไทย|เขียน.*(?:บทความ|ข่าว|เนื้อหา).*ไทย", "thai-content"),
@@ -406,11 +429,9 @@ class AIPassBridge:
     async def route_prompt(self, task_class: str, prompt: str) -> RouteResult:
         """Route prompt to best available model for task class."""
         # Reuse cached CDP connection (perf: avoid reconnect per request)
-        async with self._lock:
-            if not self._cdp_connected:
-                if not await self.cdp.connect():
-                    return RouteResult(False, "", "", error="CDP connection failed")
-                self._cdp_connected = True
+        # Use _ensure_connection() to transparently recover from connection drops
+        if not await self._ensure_connection():
+            return RouteResult(False, "", "", error="CDP connection failed")
 
         try:
             # Get available models for this task class
@@ -433,7 +454,15 @@ class AIPassBridge:
             # Media generation takes longer — extend timeout
             self._media_timeout = 300.0 if task_class in ('music', 'image', 'video', 'audio') else 120.0
 
+            # If first model failed but looks like a transient error (coroutine/timeout)
+            # and task uses a premium model like Opus, allow one retry with lower effort
+            # (keeps continuity without looping endlessly)
+            retry_once = False
             for model in available:
+                if retry_once:
+                    retry_once = False
+                    # Skip retry for already-tried first model; continue with next
+                    continue
                 print(f"  [bridge] Trying: {model.id}", file=sys.stderr)
                 result = await self._try_model(model, prompt)
                 if result.success:
@@ -489,11 +518,18 @@ class AIPassBridge:
         """Select a model by clicking its card in the Radix-UI modal.
 
         Real DOM (verified Sep 2026):
-          - Trigger:  [data-testid="model-selector-trigger"]
-          - Modal:    [data-testid="model-selector-modal"]
-          - Card:     [data-testid="model-card"]  (role=button, clickable)
-          - Card name: <img alt="MODEL_NAME">
+        Before clicking, clear window.__aipass_image_store to prevent
+        memory leak from prior image-generation runs (per Opus 5 analysis).
         """
+        # Clear prior image store to prevent memory leak across runs
+        try:
+            await self.cdp.evaluate("if (window.__aipass_image_store) window.__aipass_image_store = {};")
+        except Exception:
+            pass  # non-fatal: store may not exist yet
+
+        # 1. Click model-selector trigger
+        # 2. Clear image store (done above)
+        # 3. Skip if same model
         # OPTIMIZATION: Skip if same model as last request (modal already showing that model)
         if self._last_model_id == model_id:
             return  # No DOM roundtrip needed — already selected
@@ -658,6 +694,12 @@ class AIPassBridge:
         # and return only the storage key + metadata. Python reads the bytes
         # back via a small follow-up call.
         while time.time() - start < timeout:
+            elapsed = time.time() - start
+            # Hang detection: 80% of timeout with no content received -> break early
+            # (Opus 5 / long-context models can hang; don't waste 120s of timeout)
+            if elapsed > (timeout * 0.8) and not last_text:
+                print(f"  [bridge] _wait_for_response: 80% timeout reached with no content (elapsed={elapsed:.1f}s), breaking", file=sys.stderr)
+                break
             try:
                 # Find the last assistant message and extract content
                 # (text AND images, so image-generation models return URLs).

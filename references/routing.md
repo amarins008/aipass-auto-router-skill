@@ -23,6 +23,7 @@ The 32 models on ThaiAI-Pass as of Sep 2026:
 ## code
 Models optimized for code generation, debugging, and technical tasks.
 
+- Claude Opus 5
 - Kimi K2.7 Code
 - DeepSeek V3.2
 - Claude Sonnet 5
@@ -53,7 +54,7 @@ Models with strong Thai language understanding and generation.
 - Llama 4 Maverick
 
 ## fast
-Models optimized for speed and low latency.
+Models optimized for speed and low latency (text chat). Video/audio "Fast" variants are NOT included here — those route under `video` / `audio`.
 
 - Gemini 3.1 Flash Lite
 - Gemini 3.7 Flash
@@ -61,8 +62,6 @@ Models optimized for speed and low latency.
 - Qwen3-Next
 - MiniMax M2
 - Mistral Medium 3
-- Seedance 2.0 Fast
-- Veo 3.1 Fast
 
 ## research
 Models with broad knowledge, long context, and research capabilities.
@@ -73,7 +72,7 @@ Models with broad knowledge, long context, and research capabilities.
 - Claude Sonnet 5
 - GPT-5.6 Sol
 - Gemini 3.1 Pro (Preview)
-- Sonar
+- Sonar Reasoning Pro
 
 ## music
 Text-to-music generation.
@@ -81,9 +80,15 @@ Text-to-music generation.
 - Lyria 3 Pro
 - Lyria 3 Clip
 
+## image-thai
+Image generation with strong Thai text rendering. Use when the image needs to contain readable Thai characters (signs, posters, text overlays, etc.). Models listed here are tested for Thai typography accuracy.
+- Nano Banana Pro
+- Nano Banana
+- Seedream 5.0 Lite
+- Seedream 4.0
+
 ## image
 Image generation from text prompts. Returns base64/URL in the assistant message.
-
 - Nano Banana Pro
 - Nano Banana
 - Seedream 5.0 Lite
@@ -92,14 +97,16 @@ Image generation from text prompts. Returns base64/URL in the assistant message.
 ## video
 Text-to-video generation. Higher latency than image.
 
-- Veo 3.1 Fast
-- Seedance 2.0
-- Seedance 2.0 Fast
-- Seedance 2.0 Mini
+- Veo 3.1 Fast      (quick previews / drafts)
+- Seedance 2.0 Mini (budget / short clips)
+- Seedance 2.0 Fast (balanced)
+- Seedance 2.0      (best quality, slower)
 
 ## audio
 Audio/speech generation (TTS, voice).
 
+- Lyria 3 Pro
+- Lyria 3 Clip
 - (TTS models in ThaiAI-Pass; if unavailable, fall back to text)
 
 ---
